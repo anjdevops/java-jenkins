@@ -1,29 +1,88 @@
 pipeline {
     agent {
-        docker {
-            image 'maven:3-alpine'
-            args '-v /root/.m2:/root/.m2'
+        node {
+            label 'AWSNode'
         }
+    }
+    options {
+        disableConcurrentBuilds()
+    }
+    environment {
+        MYAPP_VERSION = """${sh(
+                returnStdout: true,
+                script: 'echo -n "${BUILD_NUMBER}-${GIT_COMMIT:0:6}"'
+            )}"""
     }
     stages {
         stage('Build') {
             steps {
-                sh 'mvn -B -DskipTests clean package'
-            }
-        }
-        stage('Test') {
-            steps {
-                sh 'mvn test'
-            }
-            post {
-                always {
-                    junit 'target/surefire-reports/*.xml'
+                script {
+                    echo 'Building package here'
+                    sh "echo $BRANCH_NAME"
+                    sh './gradlew -q clean dependencyReport --refresh-dependencies'
                 }
             }
         }
-        stage('Deliver') {
+        stage('Run Sonar Analysis') {
+            when {
+                anyOf {
+                    branch 'master';
+                    changeRequest()
+                } 
+            }
             steps {
-                sh './jenkins/scripts/deliver.sh'
+                script {
+                    withSonarQubeEnv(credentialsId: 'sonar_key', installationName: 'SonarQube01') 
+                            sh "./gradlew sonarqube"
+                        }
+                    }
+                }
+                sleep(30)
+            }
+        }
+        stage("Sonar Quality Gate") {
+            when {
+                anyOf {
+                    branch 'master';
+                    changeRequest()
+                } 
+            }
+            steps {
+                timeout(time: 1, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+        stage('Publish To Nexus') {
+            when {
+                branch 'master'
+            }
+            steps {
+                sh './gradlew publish'
+            }
+        }
+       
+
+    post {
+         always {
+            publishHTML (target: [
+                                allowMissing: true,
+                                alwaysLinkToLastBuild: false,
+                                keepAll: true,
+                                reportDir: 'build/reports/tests/test',
+                                reportFiles: 'index.html',
+                                reportName: "Test Report"
+                ])
+            junit allowEmptyResults: true, keepLongStdio: true, skipPublishingChecks: true, testResults: 'build/test-results/test/*.xml'
+            cleanWs()
+        }
+        unsuccessful {
+            script {
+                if (env.BRANCH_NAME == 'master') {
+                    withCredentials([string(credentialsId: 'o2o_teams_webhookurl', variable: 'WEBHOOKURL')]) {
+                      office365ConnectorSend webhookUrl: "${WEBHOOKURL}"
+                    }
+                }
             }
         }
     }
